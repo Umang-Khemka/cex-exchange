@@ -5,6 +5,8 @@ import cookieParser from "cookie-parser";
 import { prisma } from "./lib/db.js";
 import { store  } from "./lib/store.js";
 import authRoutes from "./routes/auth.routes.js";
+import marketRoutes from "./routes/market.routes.js";
+import orderRoutes from "./routes/order.router.js";
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -15,6 +17,8 @@ app.use(cookieParser());
 
 // ── Routes ──────────────────────────
 app.use("/api/auth", authRoutes);
+app.use("/api/orders",  orderRoutes);
+app.use("/api/markets", marketRoutes);
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
