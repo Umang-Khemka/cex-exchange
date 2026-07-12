@@ -1,30 +1,29 @@
 import "dotenv/config";
-import express    from "express";
-import cors       from "cors";
-import cookieParser from "cookie-parser";
-import { prisma } from "./lib/db.js";
-import { store  } from "./lib/store.js";
-import authRoutes from "./routes/auth.routes.js";
-import marketRoutes from "./routes/market.routes.js";
-import orderRoutes from "./routes/order.router.js";
+import http           from "http";
+import express        from "express";
+import cors           from "cors";
+import cookieParser   from "cookie-parser";
+import { prisma }     from "./lib/db.js";
+import { store }      from "./lib/store.js";
+import { wsManager }  from "./lib/websocket.js";
+import authRoutes     from "./routes/auth.routes.js";
+import orderRoutes    from "./routes/order.routes.js";
+import marketRoutes   from "./routes/market.routes.js";
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
+const app    = express();
+const PORT   = process.env.PORT || 3000;
+const server = http.createServer(app); // http server wrapping express
 
 app.use(cors({ origin: "http://localhost:5173", credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 
-// ── Routes ──────────────────────────
-app.use("/api/auth", authRoutes);
+app.use("/api/auth",    authRoutes);
 app.use("/api/orders",  orderRoutes);
 app.use("/api/markets", marketRoutes);
 
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok" });
-});
+app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
-// ── Bootstrap ────────────────────────
 async function bootstrap() {
   const markets = await prisma.market.findMany();
   markets.forEach((m) => store.initMarket(m.symbol));
@@ -49,7 +48,14 @@ async function bootstrap() {
   }
 
   console.log(`✅ ${markets.length} markets | ${openOrders.length} open orders loaded`);
-  app.listen(PORT, () => console.log(`🚀 http://localhost:${PORT}`));
+
+  // init WebSocket BEFORE server starts listening
+  wsManager.init(server);
+
+  server.listen(PORT, () => {
+    console.log(`🚀 http://localhost:${PORT}`);
+    console.log(`🔌 WebSocket ready on ws://localhost:${PORT}`);
+  });
 }
 
 bootstrap().catch((err) => {

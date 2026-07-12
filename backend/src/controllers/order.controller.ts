@@ -1,8 +1,10 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/db.js";
-import { store  } from "../lib/store.js";
+import { store } from "../lib/store.js";
 import { MatchingEngine } from "../lib/engine.js";
 import type { CreateOrderBody } from "../types/index.js";
+import { BalanceSync } from "../lib/balanceSync.js";
+import { wsManager } from "../lib/websocket.js";
 
 // POST /api/orders
 export const placeOrder = async (req: Request, res: Response) => {
@@ -11,19 +13,26 @@ export const placeOrder = async (req: Request, res: Response) => {
 
   try {
     if (!market || !qty || !type || !side) {
-      return res.status(400).json({ message: "market, qty, type, side are required" });
+      return res
+        .status(400)
+        .json({ message: "market, qty, type, side are required" });
     }
     if (type === "LIMIT" && !price) {
-      return res.status(400).json({ message: "price required for LIMIT orders" });
+      return res
+        .status(400)
+        .json({ message: "price required for LIMIT orders" });
     }
 
-    const marketRow = await prisma.market.findUnique({ where: { symbol: market } });
-    if (!marketRow) return res.status(404).json({ message: "Market not found" });
+    const marketRow = await prisma.market.findUnique({
+      where: { symbol: market },
+    });
+    if (!marketRow)
+      return res.status(404).json({ message: "Market not found" });
 
     const { baseAsset, quoteAsset } = marketRow;
 
     // check balance before placing
-    const lockAsset  = side === "BUY" ? quoteAsset : baseAsset;
+    const lockAsset = side === "BUY" ? quoteAsset : baseAsset;
     const lockAmount = side === "BUY" ? qty * price : qty;
 
     const balance = store.getBalance(userId, lockAsset);
@@ -33,19 +42,20 @@ export const placeOrder = async (req: Request, res: Response) => {
 
     // lock funds immediately
     store.lockFunds(userId, lockAsset, lockAmount);
+    await BalanceSync.lockFunds(userId, lockAsset, lockAmount);
 
     // create order in DB to get an ID
     const order = await prisma.order.create({
       data: {
         userId,
-        marketId:  marketRow.id,
+        marketId: marketRow.id,
         market,
-        price:     price || 0,
+        price: price || 0,
         qty,
         filledQty: 0,
         type,
         side,
-        status:    "OPEN",
+        status: "OPEN",
       },
     });
 
@@ -56,22 +66,29 @@ export const placeOrder = async (req: Request, res: Response) => {
       market,
       baseAsset,
       quoteAsset,
-      price:  price || 0,
+      price: price || 0,
       qty,
       type,
       side,
+    });
+
+    const ob = store.getOrderbook(market);
+    wsManager.broadcastOrderbook(market, {
+      bids: ob.bids.slice(0, 20),
+      asks: ob.asks.slice(0, 20),
+      lastTradedPrice: ob.lastTradedPrice,
     });
 
     // if fully filled, unlock leftover (nothing to unlock but keep it clean)
     // if partial/open, the remainder is already sitting in the book
 
     res.status(201).json({
-      message:      "Order placed",
-      orderId:      order.id,
-      status:       result.status,
-      filledQty:    result.filledQty,
+      message: "Order placed",
+      orderId: order.id,
+      status: result.status,
+      filledQty: result.filledQty,
       remainingQty: result.remainingQty,
-      fills:        result.fills.length,
+      fills: result.fills.length,
     });
   } catch (error: any) {
     console.log("Error in placeOrder controller", error.message);
@@ -82,7 +99,7 @@ export const placeOrder = async (req: Request, res: Response) => {
 // DELETE /api/orders/:id
 export const cancelOrder = async (req: Request, res: Response) => {
   const orderId = Number(req.params.id);
-  const userId  = req.user!.id;
+  const userId = req.user!.id;
 
   try {
     const order = await prisma.order.findUnique({ where: { id: orderId } });
@@ -93,8 +110,11 @@ export const cancelOrder = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "Order cannot be cancelled" });
     }
 
-    const marketRow = await prisma.market.findUnique({ where: { symbol: order.market } });
-    if (!marketRow) return res.status(404).json({ message: "Market not found" });
+    const marketRow = await prisma.market.findUnique({
+      where: { symbol: order.market },
+    });
+    if (!marketRow)
+      return res.status(404).json({ message: "Market not found" });
 
     // remove from in-memory orderbook
     store.removeBid(order.market, orderId);
@@ -102,15 +122,26 @@ export const cancelOrder = async (req: Request, res: Response) => {
 
     // unlock remaining funds
     const remainingQty = Number(order.qty) - Number(order.filledQty);
+
     if (order.side === "BUY") {
-      store.unlockFunds(userId, marketRow.quoteAsset, remainingQty * Number(order.price));
+      const unlockAmount = remainingQty * Number(order.price);
+      store.unlockFunds(userId, marketRow.quoteAsset, unlockAmount);
+      await BalanceSync.unlockFunds(userId, marketRow.quoteAsset, unlockAmount); // ← ADD
     } else {
       store.unlockFunds(userId, marketRow.baseAsset, remainingQty);
+      await BalanceSync.unlockFunds(userId, marketRow.baseAsset, remainingQty); // ← ADD
     }
 
     await prisma.order.update({
       where: { id: orderId },
-      data:  { status: "CANCELLED" },
+      data: { status: "CANCELLED" },
+    });
+
+     const ob = store.getOrderbook(order.market);
+    wsManager.broadcastOrderbook(order.market, {
+      bids:            ob.bids.slice(0, 20),
+      asks:            ob.asks.slice(0, 20),
+      lastTradedPrice: ob.lastTradedPrice,
     });
 
     res.status(200).json({ message: "Order cancelled" });
@@ -124,9 +155,9 @@ export const cancelOrder = async (req: Request, res: Response) => {
 export const getOrders = async (req: Request, res: Response) => {
   try {
     const orders = await prisma.order.findMany({
-      where:   { userId: req.user!.id },
+      where: { userId: req.user!.id },
       orderBy: { createdAt: "desc" },
-      take:    50,
+      take: 50,
     });
     res.status(200).json(orders);
   } catch (error: any) {
@@ -139,9 +170,9 @@ export const getOrders = async (req: Request, res: Response) => {
 export const getFills = async (req: Request, res: Response) => {
   try {
     const fills = await prisma.fill.findMany({
-      where:   { userId: req.user!.id },
+      where: { userId: req.user!.id },
       orderBy: { createdAt: "desc" },
-      take:    50,
+      take: 50,
     });
     res.status(200).json(fills);
   } catch (error: any) {
@@ -153,8 +184,8 @@ export const getFills = async (req: Request, res: Response) => {
 // GET /api/orders/balance
 export const getBalance = (req: Request, res: Response) => {
   try {
-    const userId  = req.user!.id;
-    const assets  = ["USD", "SOL", "BTC", "AXIS"];
+    const userId = req.user!.id;
+    const assets = ["USD", "SOL", "BTC", "AXIS"];
     const balance: Record<string, any> = {};
 
     for (const asset of assets) {
@@ -184,7 +215,7 @@ export const deposit = async (req: Request, res: Response) => {
 
     // update DB
     await prisma.balance.upsert({
-      where:  { userId_asset: { userId, asset } },
+      where: { userId_asset: { userId, asset } },
       update: { available: { increment: amount } },
       create: { userId, asset, available: amount, locked: 0 },
     });
