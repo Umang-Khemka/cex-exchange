@@ -1,7 +1,6 @@
 import { prisma }        from "./db.js";
 import { store }         from "./store.js";
-import { CandleService } from "./candle.js";
-import { BalanceSync }   from "./balanceSync.js";
+import { dbQueue }       from "./queue.js";
 import { wsManager }     from "./websocket.js";
 import type { OrderSide, OrderType, TradeResult, MatchedFill, OrderStatus } from "../types/index.js";
 
@@ -25,7 +24,13 @@ export class MatchingEngine {
     let   remainingQty = qty;
     const opposingSide = side === "BUY" ? ob.asks : ob.bids;
 
-    // ── Matching loop ─────────────────────────────────────────
+    // track what needs to go to DB
+    const makerUpdates:   any[] = [];
+    const balanceChanges: any[] = [];
+    const candleUpdates:  any[] = [];
+    const dbFills:        any[] = [];
+
+    // ── Pure RAM matching loop ─────────────────────────
     while (remainingQty > 0 && opposingSide.length > 0) {
       const best = opposingSide[0];
 
@@ -38,109 +43,106 @@ export class MatchingEngine {
       const fillPrice = best.price;
 
       fills.push({
-        price:        fillPrice,
-        qty:          fillQty,
-        makerOrderId: best.orderId,
-        makerUserId:  best.userId,
-        takerOrderId: orderId,
-        takerUserId:  userId,
+        price: fillPrice, qty: fillQty,
+        makerOrderId: best.orderId, makerUserId: best.userId,
+        takerOrderId: orderId,      takerUserId: userId,
       });
 
       best.qty     -= fillQty;
       remainingQty -= fillQty;
       filledQty    += fillQty;
 
-      // update last traded price + candles on every fill
+      // RAM only — instant
       store.setLastTradedPrice(market, fillPrice);
-      await CandleService.updateCandles(market, fillPrice, fillQty);
 
-      // update maker order in DB
+      const buyerUserId  = side === "BUY" ? userId : best.userId;
+      const sellerUserId = side === "BUY" ? best.userId : userId;
+
+      // settle RAM balances immediately
+      store.settleTrade(buyerUserId, sellerUserId, baseAsset, quoteAsset, fillQty, fillPrice);
+
+      // collect maker update for DB
       if (best.qty <= 0) {
         opposingSide.shift();
-        await prisma.order.update({
-          where: { id: best.orderId },
-          data:  { status: "FILLED", filledQty: { increment: fillQty } },
-        });
+        makerUpdates.push({ orderId: best.orderId, filledQty: fillQty, status: "FILLED" });
       } else {
-        await prisma.order.update({
-          where: { id: best.orderId },
-          data:  { filledQty: { increment: fillQty }, status: "PARTIALLY_FILLED" },
-        });
+        makerUpdates.push({ orderId: best.orderId, filledQty: fillQty, status: "PARTIALLY_FILLED" });
       }
+
+      // collect fills for DB
+      dbFills.push(
+        { qty: fillQty, price: fillPrice, side: "SELL", fillType: "MAKER", userId: best.userId, asset: market, originalOrderId: best.orderId },
+        { qty: fillQty, price: fillPrice, side: "BUY",  fillType: "TAKER", userId,             asset: market, originalOrderId: orderId      }
+      );
+
+      // collect balance changes for DB
+      const totalCost = fillQty * fillPrice;
+      balanceChanges.push(
+        { userId: buyerUserId,  asset: quoteAsset, locked: totalCost, upsert: false },
+        { userId: buyerUserId,  asset: baseAsset,  available: fillQty, upsert: true },
+        { userId: sellerUserId, asset: baseAsset,  locked: fillQty,   upsert: false },
+        { userId: sellerUserId, asset: quoteAsset, available: totalCost, upsert: true }
+      );
+
+      // collect candle updates for DB
+      candleUpdates.push({ market, price: fillPrice, qty: fillQty });
+
+      // broadcast trade in real time (RAM only, instant)
+      wsManager.broadcastTrade(market, { price: fillPrice, qty: fillQty, side, ts: Date.now() });
+      wsManager.sendBalanceUpdate(buyerUserId,  { asset: baseAsset,  ...store.getBalance(buyerUserId,  baseAsset)  });
+      wsManager.sendBalanceUpdate(sellerUserId, { asset: quoteAsset, ...store.getBalance(sellerUserId, quoteAsset) });
     }
 
-    // ── Determine taker status ────────────────────────────────
+    // determine status
     let status: OrderStatus = "OPEN";
-    if (remainingQty === 0) status = "FILLED";
-    else if (filledQty > 0) status = "PARTIALLY_FILLED";
+    if (remainingQty === 0)      status = "FILLED";
+    else if (filledQty > 0)      status = "PARTIALLY_FILLED";
 
-    // ── Persist fills to DB first, then settle RAM + broadcast ─
-    if (fills.length > 0) {
-      // 1. DB write first (crash safety)
-      await this.persistFills(fills, market);
-
-      // 2. settle RAM + sync DB balances + broadcast per fill
-      for (const fill of fills) {
-        const buyerUserId  = side === "BUY" ? userId : fill.makerUserId;
-        const sellerUserId = side === "BUY" ? fill.makerUserId : userId;
-
-        // RAM
-        store.settleTrade(buyerUserId, sellerUserId, baseAsset, quoteAsset, fill.qty, fill.price);
-
-        // DB balance sync
-        await BalanceSync.settleTrade(buyerUserId, sellerUserId, baseAsset, quoteAsset, fill.qty, fill.price);
-
-        // broadcast trade to all market subscribers
-        wsManager.broadcastTrade(market, {
-          price: fill.price,
-          qty:   fill.qty,
-          side,
-          ts:    Date.now(),
-        });
-
-        // push balance update to each user personally
-        wsManager.sendBalanceUpdate(buyerUserId,  { asset: baseAsset,  ...store.getBalance(buyerUserId,  baseAsset)  });
-        wsManager.sendBalanceUpdate(sellerUserId, { asset: quoteAsset, ...store.getBalance(sellerUserId, quoteAsset) });
-      }
-
-      // 3. broadcast updated orderbook to all market subscribers
-      const ob = store.getOrderbook(market);
-      wsManager.broadcastOrderbook(market, {
-        bids:            ob.bids.slice(0, 20),
-        asks:            ob.asks.slice(0, 20),
-        lastTradedPrice: ob.lastTradedPrice,
-      });
-    }
-
-    // ── Add remainder to book if limit order not fully filled ──
+    // add remainder to book
     if (type === "LIMIT" && remainingQty > 0) {
       const level = { orderId, userId, price, qty: remainingQty };
       if (side === "BUY") store.addBid(market, level);
       else                store.addAsk(market, level);
     }
 
-    // ── Update taker order in DB ───────────────────────────────
-    await prisma.order.update({
-      where: { id: orderId },
-      data:  { status, filledQty: { increment: filledQty } },
+    // broadcast updated orderbook (RAM, instant)
+    const ob2 = store.getOrderbook(market);
+    wsManager.broadcastOrderbook(market, {
+      bids: ob2.bids.slice(0, 20),
+      asks: ob2.asks.slice(0, 20),
+      lastTradedPrice: ob2.lastTradedPrice,
     });
 
-    return { filledQty, remainingQty, fills, status };
-  }
+    // ── Push ALL DB writes to queue in one job ─────────
+    if (fills.length > 0) {
+      dbQueue.add("settle_order", {
+        type: "SETTLE_ORDER",
+        data: {
+          takerOrderId: orderId,
+          takerStatus:  status,
+          takerFilledQty: filledQty,
+          makerUpdates,
+          fills:          dbFills,
+          balanceChanges,
+          candleUpdates,
+        },
+      }).catch((err) => console.log("settle_order enqueue failed", err.message));
+    } else {
+      // no fills — just update taker order status in DB async
+      dbQueue.add("update_order", {
+        type: "SETTLE_ORDER",
+        data: {
+          takerOrderId:   orderId,
+          takerStatus:    status,
+          takerFilledQty: filledQty,
+          makerUpdates:   [],
+          fills:          [],
+          balanceChanges: [],
+          candleUpdates:  [],
+        },
+      }).catch((err) => console.log("update_order enqueue failed", err.message));
+    }
 
-  private static async persistFills(fills: MatchedFill[], asset: string) {
-    const rows = fills.flatMap((f) => [
-      {
-        qty: f.qty, price: f.price,
-        side: "SELL" as const, fillType: "MAKER" as const,
-        userId: f.makerUserId, asset, originalOrderId: f.makerOrderId,
-      },
-      {
-        qty: f.qty, price: f.price,
-        side: "BUY" as const, fillType: "TAKER" as const,
-        userId: f.takerUserId, asset, originalOrderId: f.takerOrderId,
-      },
-    ]);
-    await prisma.fill.createMany({ data: rows });
+    return { filledQty, remainingQty, fills, status };
   }
 }

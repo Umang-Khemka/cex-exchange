@@ -8,6 +8,7 @@ import type {
 class InMemoryStore {
   private orderbooks: Map<string, Orderbook> = new Map();
   private balances:   BalanceStore           = new Map();
+  private orderIdCounter: number = 1;
 
   // ── Orderbook ────────────────────────────
   initMarket(market: string): void {
@@ -67,6 +68,14 @@ class InMemoryStore {
     const b = this.balances.get(userId)?.get(asset);
     if (!b) throw new Error(`No balance for user ${userId} asset ${asset}`);
     return b;
+  }
+
+  setOrderIdCounter(lastId: number): void {
+    this.orderIdCounter = lastId;
+  }
+
+  generateOrderId(): number {
+    return ++this.orderIdCounter;
   }
 
   lockFunds(userId: number, asset: string, amount: number): void {

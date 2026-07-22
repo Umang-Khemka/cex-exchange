@@ -5,11 +5,13 @@ import { MatchingEngine } from "../lib/engine.js";
 import type { CreateOrderBody } from "../types/index.js";
 import { BalanceSync } from "../lib/balanceSync.js";
 import { wsManager } from "../lib/websocket.js";
+import { dbQueue } from "../lib/queue.js";
 
 // POST /api/orders
 export const placeOrder = async (req: Request, res: Response) => {
   const { market, price, qty, type, side } = req.body as CreateOrderBody;
   const userId = req.user!.id;
+  const tStart = Date.now(); 
 
   try {
     if (!market || !qty || !type || !side) {
@@ -26,6 +28,7 @@ export const placeOrder = async (req: Request, res: Response) => {
     const marketRow = await prisma.market.findUnique({
       where: { symbol: market },
     });
+    console.log("⏱ after market lookup:", Date.now() - tStart, "ms");
     if (!marketRow)
       return res.status(404).json({ message: "Market not found" });
 
@@ -41,27 +44,57 @@ export const placeOrder = async (req: Request, res: Response) => {
     }
 
     // lock funds immediately
-    store.lockFunds(userId, lockAsset, lockAmount);
-    await BalanceSync.lockFunds(userId, lockAsset, lockAmount);
+    // store.lockFunds(userId, lockAsset, lockAmount);
+    // // await BalanceSync.lockFunds(userId, lockAsset, lockAmount);
+    // await dbQueue.add("lock_funds", {
+    //   type: "LOCK_FUNDS",
+    //   data: { userId, asset: lockAsset, amount: lockAmount },
+    // });
 
     // create order in DB to get an ID
-    const order = await prisma.order.create({
+    // const order = await prisma.order.create({
+    //   data: {
+    //     userId,
+    //     marketId: marketRow.id,
+    //     market,
+    //     price: price || 0,
+    //     qty,
+    //     filledQty: 0,
+    //     type,
+    //     side,
+    //     status: "OPEN",
+    //   },
+    // });
+
+    const orderId = store.generateOrderId();
+    store.lockFunds(userId, lockAsset, lockAmount);
+    console.log("⏱ after lock:", Date.now() - tStart, "ms");
+
+    // push BOTH DB writes to queue — no awaiting
+    dbQueue.add("lock_and_create", {
+      type: "LOCK_AND_CREATE",
       data: {
-        userId,
-        marketId: marketRow.id,
-        market,
-        price: price || 0,
-        qty,
-        filledQty: 0,
-        type,
-        side,
-        status: "OPEN",
+        lockUserId: userId,
+        lockAsset,
+        lockAmount,
+        order: {
+          id: orderId,
+          userId,
+          marketId: marketRow.id,
+          market,
+          price: price || 0,
+          qty,
+          filledQty: 0,
+          type,
+          side,
+          status: "OPEN",
+        },
       },
     });
 
     // run through matching engine
     const result = await MatchingEngine.processOrder({
-      orderId: order.id,
+      orderId,
       userId,
       market,
       baseAsset,
@@ -71,6 +104,8 @@ export const placeOrder = async (req: Request, res: Response) => {
       type,
       side,
     });
+
+    console.log("⏱ after matching engine:", Date.now() - tStart, "ms"); 
 
     const ob = store.getOrderbook(market);
     wsManager.broadcastOrderbook(market, {
@@ -82,9 +117,11 @@ export const placeOrder = async (req: Request, res: Response) => {
     // if fully filled, unlock leftover (nothing to unlock but keep it clean)
     // if partial/open, the remainder is already sitting in the book
 
+    console.log("⏱ before response:", Date.now() - tStart, "ms"); 
+
     res.status(201).json({
       message: "Order placed",
-      orderId: order.id,
+      orderId,
       status: result.status,
       filledQty: result.filledQty,
       remainingQty: result.remainingQty,
@@ -126,10 +163,18 @@ export const cancelOrder = async (req: Request, res: Response) => {
     if (order.side === "BUY") {
       const unlockAmount = remainingQty * Number(order.price);
       store.unlockFunds(userId, marketRow.quoteAsset, unlockAmount);
-      await BalanceSync.unlockFunds(userId, marketRow.quoteAsset, unlockAmount); // ← ADD
+      // await BalanceSync.unlockFunds(userId, marketRow.quoteAsset, unlockAmount); // ← ADD
+      await dbQueue.add("unlock_funds", {
+        type: "UNLOCK_FUNDS",
+        data: { userId, asset: marketRow.quoteAsset, amount: unlockAmount },
+      });
     } else {
       store.unlockFunds(userId, marketRow.baseAsset, remainingQty);
-      await BalanceSync.unlockFunds(userId, marketRow.baseAsset, remainingQty); // ← ADD
+      // await BalanceSync.unlockFunds(userId, marketRow.baseAsset, remainingQty); // ← ADD
+      await dbQueue.add("unlock_funds", {
+        type: "UNLOCK_FUNDS",
+        data: { userId, asset: marketRow.baseAsset, amount: remainingQty },
+      });
     }
 
     await prisma.order.update({
@@ -137,10 +182,10 @@ export const cancelOrder = async (req: Request, res: Response) => {
       data: { status: "CANCELLED" },
     });
 
-     const ob = store.getOrderbook(order.market);
+    const ob = store.getOrderbook(order.market);
     wsManager.broadcastOrderbook(order.market, {
-      bids:            ob.bids.slice(0, 20),
-      asks:            ob.asks.slice(0, 20),
+      bids: ob.bids.slice(0, 20),
+      asks: ob.asks.slice(0, 20),
       lastTradedPrice: ob.lastTradedPrice,
     });
 
