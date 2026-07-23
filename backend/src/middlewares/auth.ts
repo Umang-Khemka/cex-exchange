@@ -6,7 +6,7 @@ import { prisma } from "../lib/db.js";
 declare global {
   namespace Express {
     interface Request {
-      user?: { id: number; username: string };
+      user?: { id: number; username: string; email: string };
     }
   }
 }
@@ -31,7 +31,7 @@ export const authenticate = async (
 
     const user = await prisma.user.findUnique({
       where:  { id: decoded.sub },
-      select: { id: true, username: true },
+      select: { id: true, username: true, email: true },
     });
 
     if (!user) {

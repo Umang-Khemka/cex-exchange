@@ -13,6 +13,7 @@ datasource db {
 model User {
   id        Int       @id @default(autoincrement())
   username  String    @unique
+  email     String    @unique
   password  String
   createdAt DateTime  @default(now())
 
@@ -40,7 +41,7 @@ model Market {
 // ORDERS
 // ─────────────────────────────────────────
 model Order {
-  id        Int         @id @default(autoincrement())
+  id        Int         @id
   userId    Int
   marketId  Int
   market    String

@@ -9,7 +9,7 @@ class InMemoryStore {
   private orderbooks: Map<string, Orderbook> = new Map();
   private balances:   BalanceStore           = new Map();
   private orderIdCounter: number = 1;
-
+  private markets: Map<string, { id: number; baseAsset: string; quoteAsset: string }> = new Map();
   // ── Orderbook ────────────────────────────
   initMarket(market: string): void {
     if (!this.orderbooks.has(market)) {
@@ -125,6 +125,14 @@ class InMemoryStore {
     console.log(`  Last: $${ob.lastTradedPrice}`);
     ob.bids.slice(0, 5).forEach((b) => console.log(`  BID $${b.price} | qty: ${b.qty}`));
     console.log("===========================\n");
+  }
+
+  setMarket(symbol: string, data: { id: number; baseAsset: string; quoteAsset: string }): void {
+    this.markets.set(symbol, data);
+  }
+
+  getMarket(symbol: string) {
+    return this.markets.get(symbol);
   }
 }
 

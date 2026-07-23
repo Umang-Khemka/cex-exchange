@@ -11,7 +11,7 @@ import { dbQueue } from "../lib/queue.js";
 export const placeOrder = async (req: Request, res: Response) => {
   const { market, price, qty, type, side } = req.body as CreateOrderBody;
   const userId = req.user!.id;
-  const tStart = Date.now(); 
+  const tStart = Date.now();
 
   try {
     if (!market || !qty || !type || !side) {
@@ -105,7 +105,7 @@ export const placeOrder = async (req: Request, res: Response) => {
       side,
     });
 
-    console.log("⏱ after matching engine:", Date.now() - tStart, "ms"); 
+    console.log("⏱ after matching engine:", Date.now() - tStart, "ms");
 
     const ob = store.getOrderbook(market);
     wsManager.broadcastOrderbook(market, {
@@ -117,7 +117,7 @@ export const placeOrder = async (req: Request, res: Response) => {
     // if fully filled, unlock leftover (nothing to unlock but keep it clean)
     // if partial/open, the remainder is already sitting in the book
 
-    console.log("⏱ before response:", Date.now() - tStart, "ms"); 
+    console.log("⏱ before response:", Date.now() - tStart, "ms");
 
     res.status(201).json({
       message: "Order placed",
@@ -147,9 +147,7 @@ export const cancelOrder = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "Order cannot be cancelled" });
     }
 
-    const marketRow = await prisma.market.findUnique({
-      where: { symbol: order.market },
-    });
+    const marketRow = store.getMarket(order.market);
     if (!marketRow)
       return res.status(404).json({ message: "Market not found" });
 
@@ -177,9 +175,9 @@ export const cancelOrder = async (req: Request, res: Response) => {
       });
     }
 
-    await prisma.order.update({
-      where: { id: orderId },
-      data: { status: "CANCELLED" },
+    await dbQueue.add("cancel_order", {
+      type: "CANCEL_ORDER",
+      data: { orderId },
     });
 
     const ob = store.getOrderbook(order.market);

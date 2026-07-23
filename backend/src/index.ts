@@ -29,7 +29,14 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 async function bootstrap() {
   const markets = await prisma.market.findMany();
-  markets.forEach((m) => store.initMarket(m.symbol));
+  markets.forEach((m) => {
+    store.initMarket(m.symbol);
+    store.setMarket(m.symbol, {
+      id: m.id,
+      baseAsset: m.baseAsset,
+      quoteAsset: m.quoteAsset,
+    });
+  });
 
   const openOrders = await prisma.order.findMany({
     where: { status: { in: ["OPEN", "PARTIALLY_FILLED"] } },

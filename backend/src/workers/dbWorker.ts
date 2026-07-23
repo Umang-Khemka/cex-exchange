@@ -133,6 +133,14 @@ export function startDbWorker() {
           break;
         }
 
+        case "CANCEL_ORDER": {
+          await prisma.order.update({
+            where: { id: data.orderId },
+            data: { status: "CANCELLED" },
+          });
+          break;
+        }
+
         default:
           console.warn(`Unknown job type: ${type}`);
       }
