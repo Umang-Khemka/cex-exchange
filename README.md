@@ -277,8 +277,8 @@ ws://localhost:3000
 - [x] Redis AOF crash safety
 - [x] OHLCV candle generation
 - [x] WebSocket real-time updates
-- [ ] Rate limiting
-- [ ] Fee system (maker/taker)
+- [x] Rate limiting
+- [x] Fee system (maker/taker)
 - [ ] Email notifications (welcome, fill, reset)
 - [ ] Payment gateway integration
 - [ ] Trading UI (React frontend)
