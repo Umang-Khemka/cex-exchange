@@ -34,11 +34,15 @@ export function startDbWorker() {
             takerOrderId,
             takerStatus,
             takerFilledQty,
-            makerUpdates, // [{ orderId, filledQty, status }]
-            fills, // [{ qty, price, side, fillType, userId, asset, originalOrderId }]
-            balanceChanges, // [{ userId, asset, available, locked, upsert }]
-            candleUpdates, // [{ market, price, qty }]
+            makerUpdates,
+            fills,
+            balanceChanges,
+            candleUpdates,
           } = data;
+
+          // split regular balance changes from fee collections
+          const regularChanges = balanceChanges.filter((b: any) => !b.isFee);
+          const feeChanges = balanceChanges.filter((b: any) => b.isFee);
 
           // 1. update all maker orders
           await Promise.all(
@@ -54,11 +58,13 @@ export function startDbWorker() {
           );
 
           // 2. persist all fills in one bulk write
-          await prisma.fill.createMany({ data: fills });
+          if (fills.length > 0) {
+            await prisma.fill.createMany({ data: fills });
+          }
 
-          // 3. settle balances
+          // 3. settle regular balances only
           await Promise.all(
-            balanceChanges.map((b: any) =>
+            regularChanges.map((b: any) =>
               b.upsert
                 ? prisma.balance.upsert({
                     where: {
@@ -84,14 +90,28 @@ export function startDbWorker() {
             ),
           );
 
-          // 4. update candles for each fill
-          await Promise.all(
-            candleUpdates.map((c: any) =>
-              CandleService.updateCandles(c.market, c.price, c.qty),
-            ),
-          );
+          // 4. record fee collections separately
+          if (feeChanges.length > 0) {
+            await prisma.feeCollection.createMany({
+              data: feeChanges.map((f: any) => ({
+                asset: f.asset,
+                amount: f.available,
+                fillType: f.fillType,
+                userId: f.originalUserId,
+              })),
+            });
+          }
 
-          // 5. update taker order status
+          // 5. update candles
+          if (candleUpdates.length > 0) {
+            await Promise.all(
+              candleUpdates.map((c: any) =>
+                CandleService.updateCandles(c.market, c.price, c.qty),
+              ),
+            );
+          }
+
+          // 6. update taker order
           await prisma.order.update({
             where: { id: takerOrderId },
             data: {
@@ -102,7 +122,6 @@ export function startDbWorker() {
 
           break;
         }
-
         // ── Unlock funds when order cancelled ───────────
         case "UNLOCK_FUNDS": {
           await prisma.balance.update({

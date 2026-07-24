@@ -10,6 +10,7 @@ import authRoutes from "./routes/auth.routes.js";
 import orderRoutes from "./routes/order.routes.js";
 import marketRoutes from "./routes/market.routes.js";
 import { startDbWorker } from "./workers/dbWorker.js";
+import { globalLimiter, authLimiter, orderLimiter, depositLimiter } from "./middlewares/rateLimiter.js";
 
 startDbWorker(); // start the DB worker for async writes
 
@@ -20,9 +21,11 @@ const server = http.createServer(app); // http server wrapping express
 app.use(cors({ origin: "http://localhost:5173", credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
+app.use(globalLimiter);
 
-app.use("/api/auth", authRoutes);
-app.use("/api/orders", orderRoutes);
+app.use("/api/auth", authLimiter, authRoutes);
+app.use("/api/orders", orderLimiter, orderRoutes);
+// app.use("/api/deposits", depositLimiter, depositRoutes);
 app.use("/api/markets", marketRoutes);
 
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
